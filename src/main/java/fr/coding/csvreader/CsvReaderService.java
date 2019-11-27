@@ -3,84 +3,111 @@ package fr.coding.csvreader;
 import akka.Done;
 import akka.NotUsed;
 import akka.actor.ActorSystem;
-import akka.http.javadsl.ConnectHttp;
-import akka.http.javadsl.Http;
-import akka.http.javadsl.ServerBinding;
-import akka.http.javadsl.model.HttpRequest;
-import akka.http.javadsl.model.HttpResponse;
-import akka.http.javadsl.server.Route;
-import akka.http.javadsl.unmarshalling.Unmarshaller;
+import akka.event.Logging;
+import akka.event.LoggingAdapter;
 import akka.stream.ActorMaterializer;
-import akka.stream.javadsl.Flow;
-import akka.stream.javadsl.Framing;
-import akka.stream.javadsl.FramingTruncation;
-import akka.stream.javadsl.Sink;
+import akka.stream.FlowShape;
+import akka.stream.Graph;
+import akka.stream.javadsl.*;
 import akka.util.ByteString;
 import com.typesafe.config.Config;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.typesafe.config.ConfigFactory;
+import fr.coding.csvreader.balancer.Balancer;
+import io.vavr.collection.List;
+import io.vavr.control.Try;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
-
-import static akka.http.javadsl.server.Directives.*;
-import static akka.http.javadsl.server.PathMatchers.longSegment;
-import static akka.http.javadsl.server.PathMatchers.segment;
+import java.util.zip.GZIPInputStream;
 
 public class CsvReaderService implements ICsvReader {
     private final ActorSystem system;
-    private final ActorMaterializer materializer;
-    private final String importUrl;
+    private final File importDirectory;
     private final int linesToSkip;
     private final int concurrentFiles;
     private final int concurrentWrites;
     private final int nonIOParallelism;
-    private static final Logger logger = LoggerFactory.getLogger(CsvReaderService.class);
+    private static final String DELIMITER = "\t";
+    private static LoggingAdapter logger;
+
+    public static void main(String[] args) {
+        ActorSystem system = ActorSystem.create();
+        CsvReaderService csvReaderService = new CsvReaderService(ConfigFactory.load(), system);
+        csvReaderService.importFromFiles()
+                .thenAccept(d -> system.terminate());
+    }
 
     public CsvReaderService(Config config, ActorSystem system) {
         this.system = system;
-        this.materializer = ActorMaterializer.create(system);
-        this.importUrl = config.getString("importer.import-url");
+        this.importDirectory = Paths.get(config.getString("importer.import-directory")).toFile();
         this.linesToSkip = config.getInt("importer.lines-to-skip");
         this.concurrentFiles = config.getInt("importer.concurrent-files");
         this.concurrentWrites = config.getInt("importer.concurrent-writes");
         this.nonIOParallelism = config.getInt("importer.non-io-parallelism");
+        logger = Logging.getLogger(system, this);
     }
 
-    @Override
-    public void importFromHTTPSource(String url) {
-        Route route = createRoute();
-        Flow<HttpRequest, HttpResponse, NotUsed> handler = route.flow(system, materializer);
+    public CompletionStage<Done> importFromFiles() {
+        List<File> files = List.of(importDirectory.listFiles());
 
-        CompletionStage<ServerBinding> binding = Http.get(system).bindAndHandle(handler, ConnectHttp.toHost(importUrl), materializer);
+        long startTime = System.currentTimeMillis();
 
-        binding.exceptionally(error -> {
-            System.err.println("Something very bad happened! " + error.getMessage());
-            system.terminate();
-            return null;
+        Graph<FlowShape<File, ValidMovie>, NotUsed> balancer = Balancer.create(concurrentFiles, processSingleFile());
+
+        return Source.from(files)
+                .via(balancer)
+                .runForeach(this::performLogMovie, ActorMaterializer.create(system))
+                .whenComplete((d, e) -> {
+                    if (d != null) {
+                        logger.info("Import finished in {}s", (System.currentTimeMillis() - startTime) / 1000.0);
+                    } else {
+                        logger.error("Import failed with this error", e);
+                    }
+                });
+    }
+
+    private void performLogMovie(ValidMovie validMovie) {
+        logger.info("tconst : {}", validMovie.getTconst());
+    }
+
+    private Flow<File, ValidMovie, NotUsed> processSingleFile() {
+        return Flow.of(File.class)
+                .via(parseFile())
+                .via(filterMovies());
+    }
+
+    private Flow<Movie, ValidMovie, NotUsed> filterMovies() {
+        return Flow.of(Movie.class)
+                .filter(ValidMovie.class::isInstance)
+                .map(ValidMovie.class::cast);
+    }
+
+    private Flow<File, Movie, NotUsed> parseFile() {
+        return Flow.of(File.class).flatMapConcat(file -> {
+            GZIPInputStream inputStream = new GZIPInputStream(new FileInputStream(file));
+            return StreamConverters.fromInputStream(() -> inputStream)
+                    .via(lineDelimiter)
+                    .drop(linesToSkip)
+                    .map(ByteString::utf8String)
+                    .mapAsync(nonIOParallelism, this::parseLine);
         });
-
-        system.terminate();
     }
 
-    private Route createRoute() {
-        Flow<ByteString, ByteString, NotUsed> delimiter =
-                Framing.delimiter(ByteString.fromString("\n"), 256, FramingTruncation.ALLOW);
+    private Flow<ByteString, ByteString, NotUsed> lineDelimiter =
+            Framing.delimiter(ByteString.fromString("\n"), 1064, FramingTruncation.ALLOW);
 
-        return path(segment("metadata").slash(longSegment()), id ->
-                entity(Unmarshaller.entityToMultipartFormData(), formData -> {
-                    CompletionStage<Done> done = formData.getParts().mapAsync(1, bodyPart ->
-                            bodyPart.getFilename().filter(name -> name.endsWith(".csv")).map(ignored ->
-                                    bodyPart.getEntity().getDataBytes()
-                                            .via(delimiter)
-                                            .map(bs -> bs.utf8String().split(","))
-                                            .runForeach(System.out::println, materializer)
-                            ).orElseGet(() ->
-                                    // in case the uploaded file is not a CSV
-                                    CompletableFuture.completedFuture(Done.getInstance()))
-                    ).runWith(Sink.ignore(), materializer);
-                    // when processing have finished create a response for the user
-                    return onComplete(() -> done, ignored -> complete("ok!"));
-                }));
+    private CompletionStage<Movie> parseLine(String line) {
+        return CompletableFuture.supplyAsync(() -> {
+            List<String> separatedValues = List.ofAll(Arrays.asList(line.split(DELIMITER)));
+
+            return Try
+                    .of(() -> (Movie) ValidMovie.create(separatedValues))
+                    .onFailure(e -> logger.error("Unable to parse movie: {}: | error : {}", line, e.getMessage()))
+                    .getOrElse(new InvalidMovie(separatedValues.get(0)));
+        });
     }
 }
