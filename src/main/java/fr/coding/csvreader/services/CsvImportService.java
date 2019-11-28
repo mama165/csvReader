@@ -12,6 +12,7 @@ import akka.stream.Graph;
 import akka.stream.javadsl.*;
 import akka.util.ByteString;
 import com.typesafe.config.Config;
+import com.typesafe.config.ConfigFactory;
 import fr.coding.csvreader.balancer.Balancer;
 import fr.coding.csvreader.features.ICsvReader;
 import fr.coding.csvreader.models.InvalidMovie;
@@ -30,7 +31,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.zip.GZIPInputStream;
 
 public final class CsvImportService implements ICsvReader {
-    private final ActorSystem system;
+    private final ActorSystemService actorSystemService;
     private final MessageQueueRepository messageQueueRepository;
     private final File importDirectory;
     private final int linesToSkip;
@@ -41,25 +42,39 @@ public final class CsvImportService implements ICsvReader {
     private static final int MAXIMUM_FRAME_LENGTH = 1064;
     private static LoggingAdapter logger;
 
-    public CsvImportService(Config config, ActorSystem system, MessageQueueRepository messageQueueRepository) {
-        this.system = system;
+    public static void main(String[] args) {
+//        CsvImportService csvImportService = new CsvImportService(ConfigService, ActorSystem.create(), new MessageQueueRepositoryImpl());
+//        csvImportService.readCsv("movie", "Comedy");
+    }
+
+    public CsvImportService(ConfigService configService, ActorSystemService actorSystemService, MessageQueueRepository messageQueueRepository) {
+        this.actorSystemService = actorSystemService;
         this.messageQueueRepository = messageQueueRepository;
-        this.importDirectory = Paths.get(config.getString("importer.import-directory")).toFile();
-        this.linesToSkip = config.getInt("importer.lines-to-skip");
-        this.concurrentFiles = config.getInt("importer.concurrent-files");
-        this.concurrentWrites = config.getInt("importer.concurrent-writes");
-        this.nonIOParallelism = config.getInt("importer.non-io-parallelism");
-        logger = Logging.getLogger(system, CsvImportService.class);
+        this.importDirectory = Paths.get(getConfig(configService).getString("importer.import-directory")).toFile();
+        this.linesToSkip = getConfig(configService).getInt("importer.lines-to-skip");
+        this.concurrentFiles = getConfig(configService).getInt("importer.concurrent-files");
+        this.concurrentWrites = getConfig(configService).getInt("importer.concurrent-writes");
+        this.nonIOParallelism = getConfig(configService).getInt("importer.non-io-parallelism");
+        logger = Logging.getLogger(actorSystemService.createSystem(), CsvImportService.class);
+    }
+
+    private Config getConfig(ConfigService configService) {
+        return configService.load();
     }
 
     @Override
     public void readCsv(String titleType, String gender) {
+        ActorSystem actorSystem = actorSystemService.createSystem();
+
         importFromFiles(titleType, gender)
-                .thenAccept(d -> system.terminate());
+                .thenAccept(d -> {
+                    actorSystem.terminate();
+                });
     }
 
     private CompletionStage<Done> importFromFiles(String titleType, String gender) {
         List<File> filteredFiles = filterFilesWithExtension(importDirectory.listFiles(), ".gz");
+        ActorMaterializer materializer = ActorMaterializer.create(actorSystemService.createSystem());
 
         long startTime = System.currentTimeMillis();
 
@@ -67,8 +82,8 @@ public final class CsvImportService implements ICsvReader {
 
         return Source.from(filteredFiles)
                 .via(balancer)
-                .runForeach(this::performLogMovie, ActorMaterializer.create(system))
-
+                .alsoTo(Sink.foreach(this::performLogMovie))
+                .runWith(storeMovie(), materializer)
                 .whenComplete((d, e) -> {
                     if (d != null) {
                         logger.info("Import finished in {}s", (System.currentTimeMillis() - startTime) / 1000.0);
@@ -78,8 +93,10 @@ public final class CsvImportService implements ICsvReader {
                 });
     }
 
-    private Sink<ValidMovie, CompletionStage<Done>> egzrgerg() {
-        return null;
+    private Sink<ValidMovie, CompletionStage<Done>> storeMovie() {
+        return Flow.of(ValidMovie.class)
+                .mapAsyncUnordered(concurrentWrites, messageQueueRepository::publish)
+                .toMat(Sink.ignore(), Keep.right());
     }
 
     private List<File> filterFilesWithExtension(File[] files, String extension) {
