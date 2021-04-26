@@ -8,7 +8,7 @@
     <artifactId>CsvReader</artifactId>
     <version>1.0-SNAPSHOT</version>
     <properties>
-        <common-io.version>2.6</common-io.version>
+        <common-io.version>2.7</common-io.version>
         <akka-stream.version>2.5.25</akka-stream.version>
         <akka-http.version>10.1.10</akka-http.version>
         <akka-actor.version>2.5.25</akka-actor.version>
